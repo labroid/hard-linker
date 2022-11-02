@@ -73,7 +73,7 @@ def main():
             qhash.task_done()
 
             processed += 1
-            if not processed % 10:
+            if not processed % 1000:
                 print(
                     f"Queue: {qpath.qsize()}, Hashed: {qhash.qsize()}, Processed: {processed}, Hash hits: {hashdict_hit}"
                 )
@@ -136,7 +136,7 @@ def main():
 
     # TODO:  Assign hashes to linked files that were skipped earlier
     # TODO: Show disk free space and delta
-    logger.info(print("Done"))
+    logger.info("Done")
 
 
 def scan_filesystem(roots):
