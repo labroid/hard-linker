@@ -1,10 +1,13 @@
 import itertools
+import multiprocessing as mp
 import stat
+import time
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 import hashlib
 from pathlib import Path
 from collections import deque
 from concurrent.futures._base import TimeoutError
+from queue import Empty
 
 import dask.dataframe as dd
 from dask.diagnostics import ProgressBar
@@ -32,12 +35,53 @@ def main():
     f = f[f.duplicated(subset="size", keep=False)]  # Keep only non-unique file sizes
     # if hashes missing...
     f_single_linked = f.drop_duplicates(subset="inode", keep="first")
-    need_hash = dd.from_pandas(f_single_linked[pd.isna(f_single_linked)].reset_index().path, npartitions=8)
-    hashes = pd.DataFrame(
-        need_hash.apply(dask_hasher, convert_dtype=False, meta=pd.Series(data=None, name="md5")).compute()
-    )
-    hashes.to_pickle(HASHES_CACHE)
-    logger.info(print("Done"))
+    # need_hash = dd.from_pandas(f_single_linked[pd.isna(f_single_linked.md5)].reset_index().path, npartitions=8)
+    # hashes = pd.DataFrame(
+    #     need_hash.apply(dask_hasher, convert_dtype=False, meta=pd.Series(data=None, name="md5")).compute()
+    # )
+    # hashes.to_pickle(HASHES_CACHE)
+
+    need_hash = f_single_linked[pd.isna(f_single_linked.md5)].index
+    proc_count = 8
+    with mp.Manager() as manager:
+        qpath = mp.JoinableQueue()
+        qhash = mp.JoinableQueue()
+        logger.info(f"Filling job queue with {len(need_hash)} paths")
+        [qpath.put(p) for p in need_hash]
+        logger.info("Kicking off processes")
+        processes = []
+        for i in range(proc_count):
+            proc = mp.Process(target=worker_hasher, args=(qpath, qhash))
+            processes.append(proc)
+            proc.start()
+            print(proc)
+
+        hashdict = {}
+        hashdict_hit = 0
+        processed = 0
+        while True:
+            r = qhash.get()
+            if r is None:
+                proc_count -= 1
+                if not proc_count:
+                    break
+                continue
+            if r["hash"] in hashdict:
+                hashdict_hit += 1
+            else:
+                hashdict[r["hash"]] = r["path"]
+            qhash.task_done()
+
+            processed += 1
+            if not processed % 10:
+                print(
+                    f"Queue: {qpath.qsize()}, Hashed: {qhash.qsize()}, Processed: {processed}, Hash hits: {hashdict_hit}"
+                )
+
+        print(
+            f"Finally: Queue: {qpath.qsize()}, Hashed: {qhash.qsize()}, Processed: {processed}, Hash hits: {hashdict_hit}"
+        )
+
     # queue_target = 1000
     # hashdict = {}
     # futures = {}
@@ -92,7 +136,7 @@ def main():
 
     # TODO:  Assign hashes to linked files that were skipped earlier
     # TODO: Show disk free space and delta
-    print("Done")
+    logger.info(print("Done"))
 
 
 def scan_filesystem(roots):
@@ -168,6 +212,25 @@ def dask_hasher(path):  # TODO:  Add hashlist, hard link capabilities, and retur
                 break
             result.update(data)
     return {path: result.hexdigest()}
+
+
+def worker_hasher(qpath, qhash):
+    while True:
+        try:
+            path = qpath.get(block=True, timeout=5)
+        except Empty:
+            qhash.put_nowait(None)  # Add sentry
+            logger.info("Worker suicide...")
+            break
+        result = hashlib.md5()
+        with path.open(mode="rb") as f:
+            while True:
+                data = f.read(512 * 1024)  # 1k * 512 byte disk sectors - benchmarks pretty well
+                if not data:
+                    break
+                result.update(data)
+        qhash.put_nowait({"path": path, "hash": result.hexdigest()})
+        qpath.task_done()
 
 
 ######################################
