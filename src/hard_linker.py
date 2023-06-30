@@ -11,7 +11,7 @@ import pandas as pd
 from loguru import logger
 
 # TODO: This should be in config file or cmd line args
-ROOTS = [Path(r"C:/Users/scott/Pictures/Takeout")]
+ROOTS = [Path(r"C:\Users\scott\Pictures\Photos from CDs")]
 HASH_SAVE_PATH = ROOTS[0] / "filesystem_scan_hash_savepoint.zip"
 COMPUTE_ALL_HASHES = True
 
@@ -137,6 +137,7 @@ def assign_known_hashes_to_hard_linked_files(f: pd.DataFrame):
         df.loc[df.need_hash, "md5"] = list(hash_set)[0]
         return df
 
+    logger.info("Assigning known hashes to hard linked files...")
     affected_inodes = f.loc[(f.links > 1) & (pd.isna(f.md5))].inode.unique()
     hardlinked = f.loc[f.inode.isin(affected_inodes), ["inode", "md5"]]
     hardlinked["need_hash"] = hardlinked.md5.isna()
@@ -153,6 +154,7 @@ def assign_known_hashes_to_hard_linked_files(f: pd.DataFrame):
 
 
 def hard_link_hash_groups(df: pd.DataFrame):
+    logger.info("Hard linking files with same hash...")
     # Ignore unique hashes
     df = df.loc[df.duplicated(subset="md5", keep=False)]
     # Group by hash and link process
