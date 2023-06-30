@@ -1,11 +1,11 @@
+import hashlib
 import itertools
 import os
 import shutil
 import stat
-import hashlib
 from pathlib import Path
-import dask.dataframe as dd
 
+import dask.dataframe as dd
 import humanize
 import pandas as pd
 from loguru import logger
@@ -13,7 +13,6 @@ from loguru import logger
 # TODO: This should be in config file or cmd line args
 ROOTS = [Path(r"C:/Users/scott/Pictures/Takeout")]
 HASH_SAVE_PATH = ROOTS[0] / "filesystem_scan_hash_savepoint.zip"
-DEBUG_MODE = False
 COMPUTE_ALL_HASHES = True
 
 
@@ -23,7 +22,6 @@ def main():
     logger.info(f"Free disk space: {humanize.naturalsize(disk_free_before)}")
     logger.info("Scanning filesystem stats...")
     f = scan_filesystem(ROOTS)
-    logger.info(f"Total files: {humanize.intcomma(len(f))} files, consuming {humanize.naturalsize(f['size'].sum())}")
     f = merge_previous_scan_hashes(f, get_cached_scan(HASH_SAVE_PATH))
     f = assign_known_hashes_to_hard_linked_files(f)
     f = compute_hashes(f, compute_all_hashes=COMPUTE_ALL_HASHES)
@@ -48,7 +46,7 @@ def compute_hashes(f, compute_all_hashes=COMPUTE_ALL_HASHES):
     if not compute_all_hashes:
         f = f.loc[f.duplicated(subset="size", keep=False)]  # Ignore files with unique length
     need_hash = f.loc[pd.isna(f.md5)]
-    need_hash = need_hash[~need_hash.duplicated(subset="inode", keep='first')]
+    need_hash = need_hash[~need_hash.duplicated(subset="inode", keep="first")]
     need_hash = need_hash.reset_index()  # Preserve Path objects to column; dask mangles objects used in index
     need_hash_dd = dd.from_pandas(need_hash.loc[:, ["path", "md5"]], npartitions=os.cpu_count())
     logger.info(f"Computing hashes for {humanize.intcomma(need_hash_dd.shape[0])} files...")
@@ -79,12 +77,6 @@ def scan_filesystem(roots: list[Path]):  # Perhaps scan lists of files or lists 
     Scans filesystem and creates dataframe of files with inode, size, mtime, links, md5 indexed by path
     """
     logger.info("Scanning filesystem stats...")
-    if DEBUG_MODE:
-        logger.info("Debug mode on - loading scan values")
-        try:
-            return pd.read_pickle(FILESYSTEM_SCAN_SAVEPOINT)
-        except (EOFError, FileNotFoundError):
-            logger.info("Debug mode on - no previous scan available")
     tree = [
         {"path": path, "stats": path.stat()} for path in itertools.chain.from_iterable([p.rglob("*") for p in roots])
     ]
@@ -105,14 +97,13 @@ def scan_filesystem(roots: list[Path]):  # Perhaps scan lists of files or lists 
         f"Total files: {humanize.intcomma(len(files))} files, consuming {humanize.naturalsize(files['size'].sum())}"
     )
     files = files.set_index(keys="path")
-    if DEBUG_MODE:
-        files.to_pickle(FILESYSTEM_SCAN_SAVEPOINT)
     return files
 
 
 def merge_previous_scan_hashes(f: pd.DataFrame, old: pd.DataFrame) -> pd.DataFrame:
     if old.empty:
         return f.assign(md5=pd.NA)
+    logger.info("Merging previous scan hashes...")
     merged = f.merge(old, how="left", left_index=True, right_index=True, suffixes=("", "_old"))
     identical = (merged["size"] == merged.size_old) & (merged.mtime == merged.mtime_old)
     merged.loc[~identical, "md5"] = pd.NA
@@ -132,46 +123,44 @@ def get_cached_scan(path: Path) -> pd.DataFrame:
 
 def assign_known_hashes_to_hard_linked_files(f: pd.DataFrame):
     def reconcile_inode_groups(df: pd.DataFrame):
-        # if df.shape[0] == 1:  # Unique inode
-        #     return df
-        have_hashes = pd.notna(df.md5)
-        if all(~have_hashes):  # No hashes in group
+        if all(df.need_hash):
             return df
-        hash_set = set(df[have_hashes].md5)
+        hash_set = df.md5.dropna().unique()
         if len(hash_set) > 1:  # Multiple hashes assigned to same inode; this is a problem
             logger.warning(
-                f"Files with same inode have different hashes. Ignoring previous scan. {df.loc[have_hashes]}"
+                f"Paths with same inode have different hashes. Ignoring previous scan. {df.path, df.md5.unique()}"
             )
             df.loc[:, "md5"] = pd.NA
             return df
-        if all(have_hashes):
+        if all(~df.need_hash):
             return df
-        df.loc[~have_hashes, "md5"] = list(hash_set)[0]
+        df.loc[df.need_hash, "md5"] = list(hash_set)[0]
         return df
-    if pd.notna(f.md5).all():
-        return f
-    hardlinked = f[f.links > 1]
+
+    affected_inodes = f.loc[(f.links > 1) & (pd.isna(f.md5))].inode.unique()
+    hardlinked = f.loc[f.inode.isin(affected_inodes), ["inode", "md5"]]
+    hardlinked["need_hash"] = hardlinked.md5.isna()
     if hardlinked.empty:
         return f
+    if hardlinked.md5.notna().all():
+        return f
     hardlinked = hardlinked.groupby("inode", group_keys=False).apply(reconcile_inode_groups)
-    f.merge(hardlinked, how="left", left_index=True, right_index=True, suffixes=("", "_old"))
-    f.loc[pd.isna(f.md5), "md5"] = f.loc[pd.isna(f.md5), "md5old"]
-    f = f.drop(columns=["md5old"])
+    hardlinked = hardlinked.loc[hardlinked.need_hash, ["md5"]]
+    merged = f.merge(hardlinked.md5, how="left", left_index=True, right_index=True, suffixes=("", "_new"))
+    merged.loc[pd.isna(f.md5), "md5"] = merged.loc[pd.isna(f.md5), "md5_new"]
+    f = merged.drop(columns=["md5_new"])
     return f
-
 
 
 def hard_link_hash_groups(df: pd.DataFrame):
     # Ignore unique hashes
     df = df.loc[df.duplicated(subset="md5", keep=False)]
     # Group by hash and link process
-    df = df.groupby("md5").apply(hard_link_paths)
+    df.groupby("md5").apply(hard_link_paths)
 
 
 def hard_link_paths(df: pd.DataFrame):
-    # Ignore unique hashes
-    if len(df) == 1:
-        return None
+    # Might be faster to return None if there is only one inode in the group (and skip if statement in loop)
     # Sort so we can link to most-hard-linked of group or arbitrarily to top of group
     df = df.sort_values(by="links", ascending=False)
     for p in df.index[1:]:
@@ -183,6 +172,7 @@ def hard_link_paths(df: pd.DataFrame):
         p.hardlink_to(df.index[0])
     return None
 
+
 def hasher(s: pd.Series):
     result = hashlib.md5()
     with s.path.open(mode="rb") as f:
@@ -192,6 +182,7 @@ def hasher(s: pd.Series):
             else:
                 break
     return result.hexdigest()
+
 
 if __name__ == "__main__":
     main()
