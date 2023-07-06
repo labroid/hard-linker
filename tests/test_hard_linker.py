@@ -153,13 +153,13 @@ class TestMergePreviousScanHashes:
 class TestHardLinkMD5Groups:
     def test_normal(self, mocker):
         mocker.patch("src.hard_linker.hard_link_paths")
-        hard_link_md5_groups(df_hash_group)
+        hard_link_hash_groups(df_hash_group)
         src.hard_linker.hard_link_paths.assert_called_with(
             [Path("a/a"), Path("a/b"), Path("a/c"), Path("a/f")], Path("a/d")
         )
 
     def test_single_row(self):
-        result = hard_link_md5_groups(df_hash_group.iloc[[1]])
+        result = hard_link_hash_groups(df_hash_group.iloc[[1]])
         pd.testing.assert_frame_equal(result, df_hash_group.iloc[[1]])
 
 
