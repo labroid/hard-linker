@@ -4,30 +4,39 @@ import os
 import shutil
 import stat
 from pathlib import Path
+import typer
 
 import dask.dataframe as dd
 import humanize
 import pandas as pd
 from loguru import logger
 
-# TODO: This should be in config file or cmd line args
-ROOTS = [Path(r"C:\Users\scott\Pictures\Photos from CDs")]
-HASH_SAVE_PATH = ROOTS[0] / "filesystem_scan_hash_savepoint.zip"
 COMPUTE_ALL_HASHES = True
+DO_NOT_HARD_LINK = True
 
 
-def main():
-    check_roots_on_same_filesystem(ROOTS)
-    disk_free_before = shutil.disk_usage(ROOTS[0]).free
+def main(target_dir: list[Path]):
+    # Future arguments:
+    #   results_dir: str = None,  TODO
+    #   compute_all_hashes: bool = False,  TODO
+    #   do_not_hard_link: bool = False,  TODO
+    #   verbose: bool = False,
+    roots = [Path(p) for p in target_dir]
+    hash_save_path = roots[0] / "filesystem_scan_hash_savepoint.zip"
+    check_roots_on_same_filesystem(roots)
+    disk_free_before = shutil.disk_usage(roots[0]).free
     logger.info(f"Free disk space: {humanize.naturalsize(disk_free_before)}")
     logger.info("Scanning filesystem stats...")
-    f = scan_filesystem(ROOTS)
-    f = merge_previous_scan_hashes(f, get_cached_scan(HASH_SAVE_PATH))
+    f = scan_filesystem(roots)
+    f = merge_previous_scan_hashes(f, get_cached_scan(hash_save_path))
     f = assign_known_hashes_to_hard_linked_files(f)
     f = compute_hashes(f, compute_all_hashes=COMPUTE_ALL_HASHES)
-    save_hashes(f, HASH_SAVE_PATH)
+    save_hashes(f, hash_save_path)
+    if DO_NOT_HARD_LINK:
+        logger.info("Hard linking disabled. Done.")
+        return 0
     hard_link_hash_groups(f)
-    disk_free_after = shutil.disk_usage(ROOTS[0]).free
+    disk_free_after = shutil.disk_usage(roots[0]).free
     print(
         f"Free disk space: {humanize.naturalsize(disk_free_after)}. "
         f"Freed {humanize.naturalsize(disk_free_after - disk_free_before)}"
@@ -49,7 +58,7 @@ def compute_hashes(f, compute_all_hashes=COMPUTE_ALL_HASHES):
     need_hash = need_hash[~need_hash.duplicated(subset="inode", keep="first")]
     need_hash = need_hash.reset_index()  # Preserve Path objects to column; dask mangles objects used in index
     need_hash_dd = dd.from_pandas(need_hash.loc[:, ["path", "md5"]], npartitions=os.cpu_count())
-    logger.info(f"Computing hashes for {humanize.intcomma(need_hash_dd.shape[0])} files...")
+    logger.info(f"Computing hashes for {humanize.intcomma(len(need_hash))} files...")
     need_hash_dd["md5"] = need_hash_dd.apply(hasher, axis=1, meta=("md5", str)).compute()
     hashed = need_hash_dd.compute().set_index("path")
     f = f.merge(hashed, how="left", left_index=True, right_index=True, suffixes=("old", ""))
@@ -187,4 +196,4 @@ def hasher(s: pd.Series):
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)
