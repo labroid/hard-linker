@@ -2,6 +2,7 @@ import hashlib
 import os
 import shutil
 import stat
+import uuid
 from pathlib import Path
 
 import dask.dataframe as dd
@@ -9,25 +10,33 @@ import humanize
 import pandas as pd
 from loguru import logger
 
+from tree_utils import scan_filesystem
+
 DO_NOT_HARD_LINK = True
 HASH_FILE_NAME = "filesystem_scan_hash_savepoint.zip"
 
 
+# How hard would it be to make this hard link or delete duplicates?
+# TODO:  Move largest linked file savings to another drive
+
+
 def hash_and_link(
     target_dirs: list[str] | list[Path],
-    compute_all_hashes: bool = True,
+    compute_all_hashes: bool = False,
     hard_link: bool = False,
     verbose: bool = False,
 ):
     roots = [Path(p) for p in target_dirs]  # Path() is idempotent; Path(Path) => Path
     logger.level("INFO") if verbose else logger.level("WARNING")
     check_roots_on_same_filesystem(roots)
+    # Check filesystem types for roots - can't hard link on FAT32, for example
     # TODO:  check_if_roots_related(roots) -> related roots reduced to parent Path.is_relative_to(Path)
+    # TODO:  check if filesystem allows hard links (NTFS, ext4, etc).  See github.com/giampaolo/psutil
     disk_free_before = shutil.disk_usage(roots[0]).free
     logger.info(f"Free disk space: {humanize.naturalsize(disk_free_before)}")
     dir_hashes = []
     for r in roots:
-        f = scan_filesystem(r)
+        f = scan_filesystem(r).set_index(keys="path")
         f = merge_previous_scan_hashes(f, get_cached_scan(r / HASH_FILE_NAME))
         f = assign_known_hashes_to_hard_linked_files(f)
         f = compute_hashes(f, compute_all_hashes=compute_all_hashes)
@@ -84,11 +93,21 @@ def check_roots_on_same_filesystem(roots: list[Path]):
         raise OSError(message)
 
 
-def scan_filesystem(root: Path):  # Perhaps scan lists of files or lists of dirs?
+def scan_filesystem(root: Path):
+    # Perhaps scan lists of files or lists of dirs? Something like this:
+    # from itertools import chain
+    #
+    # def process_items(items):
+    #     """Processes items, handling both single items and iterables."""
+    #     for item in chain.from_iterable([items] if not isinstance(items, collections.abc.Iterable) else items):
+    #         # Process each item here
+    #         pass
+    # TODO: Make the logger suitable for a library
     """
     Scans filesystem and creates dataframe of files with inode, size, mtime, links, md5 indexed by path
     """
     logger.info(f"Scanning {root}...")
+    # Descend if root is a directory otherwise just scan root file
     tree = (
         [{"path": root, "stats": root.stat()}]
         if root.is_file()
@@ -168,7 +187,7 @@ def assign_known_hashes_to_hard_linked_files(f: pd.DataFrame):
 
 
 def hard_link_hash_groups(df: pd.DataFrame):
-    logger.info(f"Hard linking files with same hash...")
+    logger.info("Hard linking files with same hash...")
     # Ignore unique hashes
     df = df.loc[df.duplicated(subset="md5", keep=False)]
     # Group by hash and link process
@@ -184,8 +203,15 @@ def hard_link_paths(df: pd.DataFrame):
         if df.loc[p].inode == df.iloc[0].inode:
             continue
         logger.info(f"Hard linking {p} to {df.index[0]}")
+        # Safe hard link by linking to temp filename and renaming if successful
+        temp_path = p.parent / uuid.uuid4().hex
+        try:
+            temp_path.hardlink_to(df.index[0])
+        except OSError as e:
+            logger.warning(f"Failed to link to {df.index[0]}: {e}")
+            return None
         p.unlink()
-        p.hardlink_to(df.index[0])
+        temp_path.rename(p)
     return None
 
 
@@ -202,7 +228,8 @@ def hasher(s: pd.Series):
 
 if __name__ == "__main__":
     TARGET_DIRS = [
-        Path(r"C:\Users\scott\Pictures\Domain Backsup not in Local Takeout\Photos"),
-        Path(r"C:\Users\scott\Pictures\Takeout"),
+        Path(r"F:"),
+        # Path(r"C:\Users\scott\Downloads\TakeoutProcessing"),
+        # Path(r"C:\Users\scott\Pictures\Takeout"),
     ]
-    hash_and_link(TARGET_DIRS, verbose=True, compute_all_hashes=True, hard_link=True)
+    hash_and_link(TARGET_DIRS, verbose=True, compute_all_hashes=False, hard_link=False)
